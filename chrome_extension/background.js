@@ -718,6 +718,10 @@ async function prepareHomeTab() {
     checking: /Environment Checking/i.test(document.title)
       || /努力加载中/.test(document.body?.innerText || '')
       || document.scripts.length > 0,
+    // Stricter than "checking" (any normal page has scripts): only a real WAF challenge page.
+    waf: /Environment Checking/i.test(document.title)
+      || /努力加载中/.test(document.body?.innerText || '')
+      || (document.scripts.length > 0 && Boolean(document.body) && !document.body.innerText.trim()),
     blank: Boolean(document.body) && !document.body.innerText.trim()
       && ![...document.body.querySelectorAll('input,button,a,iframe')]
         .some(element => element.getClientRects().length)
@@ -750,7 +754,7 @@ async function prepareHomeTab() {
     const tab = await chrome.tabs.get(workTabId).catch(() => null);
     if (tab) {
       if (!await hasSearch(workTabId)) {
-        if (tab.url !== HOME && !(await pageState(workTabId))?.checking) await navigate(workTabId, HOME);
+        if (tab.url !== HOME && !(await pageState(workTabId))?.waf) await navigate(workTabId, HOME);
         if (!await waitForSearch(workTabId)) throw new Error('GSXT 环境校验超过 3 分钟');
       }
       return workTabId;
@@ -776,7 +780,7 @@ async function prepareHomeTab() {
     throw new Error('GSXT 环境校验超过 3 分钟，请稍后重试');
   }
   workTabId = gsxtTabs[0].id;
-  if (gsxtTabs[0].url !== HOME && !(await pageState(workTabId))?.checking) await navigate(workTabId, HOME);
+  if (gsxtTabs[0].url !== HOME && !(await pageState(workTabId))?.waf) await navigate(workTabId, HOME);
   if (await waitForSearch(workTabId)) return workTabId;
   workTabId = null;
   throw new Error('GSXT 环境校验超过 3 分钟，请稍后重试');
