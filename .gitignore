@@ -1,0 +1,12 @@
+node_modules/
+.DS_Store
+.env
+.env.*
+*.log
+playwright-report/
+test-results/
+GSXT企业信用存档/
+Mac验证结果.txt
+真实网站验证结果.txt
+run-tests-mac.sh
+chrome_extension/_metadata/

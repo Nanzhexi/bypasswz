@@ -1,0 +1,19 @@
+[
+  {
+    "id": 1,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        { "header": "Cache-Control", "operation": "set", "value": "no-cache" },
+        { "header": "Pragma", "operation": "set", "value": "no-cache" },
+        { "header": "Accept", "operation": "set", "value": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7" },
+        { "header": "Accept-Language", "operation": "set", "value": "zh-CN,zh;q=0.9,en;q=0.8" }
+      ]
+    },
+    "condition": {
+      "urlFilter": "||gsxt.gov.cn",
+      "resourceTypes": ["main_frame", "sub_frame", "xmlhttprequest"]
+    }
+  }
+]

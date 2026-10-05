@@ -1,0 +1,36 @@
+const assert = require('node:assert');
+const fs = require('node:fs');
+
+const manifest = JSON.parse(fs.readFileSync('chrome_extension/manifest.json', 'utf8'));
+const popup = fs.readFileSync('chrome_extension/popup.js', 'utf8');
+const bootstrap = fs.readFileSync('chrome_extension/bootstrap.js', 'utf8');
+const runner = fs.readFileSync('chrome_extension/runner.html', 'utf8');
+const engine = fs.readFileSync('chrome_extension/background.js', 'utf8');
+const blockers = fs.readFileSync('chrome_extension/blockers.js', 'utf8');
+
+assert.equal(manifest.version, '1.7.7');
+assert.equal(manifest.background.service_worker, 'bootstrap.js');
+assert.equal(manifest.action.default_popup, 'popup.html');
+assert.equal(manifest.side_panel.default_path, 'popup.html');
+assert.ok(manifest.permissions.includes('sidePanel'));
+assert.ok(manifest.permissions.includes('management'));
+assert.ok(manifest.optional_host_permissions.includes('<all_urls>'));
+assert.match(popup, /chrome\.permissions\.request/);
+assert.ok(popup.indexOf("chrome.permissions.request") < popup.indexOf('await saveForm();'));
+assert.match(popup, /chrome\.runtime\.sendMessage/);
+assert.doesNotMatch(popup, /button\.disabled = Boolean\(runStatus\.running\)/);
+assert.match(bootstrap, /chrome\.tabs\.create\(\{ url: chrome\.runtime\.getURL\('runner\.html'\), active: false \}\)/);
+assert.equal(manifest.externally_connectable, undefined);
+assert.doesNotMatch(bootstrap, /chrome\.action\.onClicked/);
+assert.match(popup, /chrome\.tabs\.create\(\{ url: 'https:\/\/www\.gsxt\.gov\.cn\/index\.html', active: false \}\)/);
+assert.match(runner, /background\.js/);
+assert.match(runner, /runner\.js/);
+assert.match(popup, /chrome\.sidePanel\.open/);
+assert.match(engine, /当前系统繁忙/);
+assert.match(engine, /openLoginPrompt/);
+assert.match(engine, /账号密码已自动填写并提交/);
+assert.match(engine, /#btn_login/);
+assert.match(engine, /广告\/脚本拦截扩展/);
+assert.match(runner, /blockers\.js/);
+assert.match(blockers, /cfhdojbkjhnklbpkdaibdccddilifddb/);
+console.log('extension runner handshake ok');

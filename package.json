@@ -1,0 +1,14 @@
+{
+  "name": "gsxt-archive-project-1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test_extension_handshake.cjs && node test_blocker_management.cjs && node test_extension_source_guard.cjs",
+    "test:browser": "node test_extension_browser_smoke.mjs && node test_extension_no_reload.mjs",
+    "test:archive": "node test_extension_archive_smoke.mjs",
+    "install:browser": "playwright-core install chromium"
+  },
+  "dependencies": {
+    "playwright-core": "1.63.0"
+  }
+}
