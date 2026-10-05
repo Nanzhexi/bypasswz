@@ -7,7 +7,7 @@ const isGsxtUrl = value => {
 };
 const ITEMS = [
   '营业执照信息', '营业期限信息', '股东及出资信息', '主要人员信息', '分支机构信息',
-  '"多证合一"信息公示', '清算信息', '变更信息', '另册管理', '信誉信息', '行政许可信息',
+  '“多证合一”信息公示', '清算信息', '变更信息', '另册管理', '信誉信息', '行政许可信息',
   '知识产权信息', '知识产权出质登记信息', '商标注册信息', '名称转让信息',
   '动产抵押登记信息', '股权出质登记信息', '司法协助信息',
   '依人民法院判决申请撤销登记信息', '协助涤除信息', '双随机抽查结果信息',
@@ -760,7 +760,7 @@ async function runBatch(job) {
   if (job.disabledExtensions?.length) {
     await log(`已临时停用冲突扩展：${job.disabledExtensions.join('、')}；任务结束后自动恢复。`);
   }
-  await log(`开始批量任务；输出到"下载/${outputRoot}"`);
+  await log(`开始批量任务；输出到“下载/${outputRoot}”`);
   try {
     for (let index = 0; index < job.companies.length; index++) {
       const company = job.companies[index];
