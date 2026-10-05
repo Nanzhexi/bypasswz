@@ -7,7 +7,7 @@ const isGsxtUrl = value => {
 };
 const ITEMS = [
   '营业执照信息', '营业期限信息', '股东及出资信息', '主要人员信息', '分支机构信息',
-  '“多证合一”信息公示', '清算信息', '变更信息', '另册管理', '信誉信息', '行政许可信息',
+  '"多证合一"信息公示', '清算信息', '变更信息', '另册管理', '信誉信息', '行政许可信息',
   '知识产权信息', '知识产权出质登记信息', '商标注册信息', '名称转让信息',
   '动产抵押登记信息', '股权出质登记信息', '司法协助信息',
   '依人民法院判决申请撤销登记信息', '协助涤除信息', '双随机抽查结果信息',
@@ -163,7 +163,7 @@ async function tryAutoLogin(tabId, username, password) {
 
 async function handleLogin(tabId, job) {
   tabId = await openLoginPrompt(tabId);
-  await log('检测到登录页，正在填写账号密码；如出现验证码，请手动完成。');
+  await log('检测到登录页，正在填写账号密码…');
   const deadline = Date.now() + 10 * 60_000;
   let filled = false;
   let submittedAt = 0;
@@ -172,12 +172,13 @@ async function handleLogin(tabId, job) {
     if (!filled && await tryAutoLogin(tabId, job.username, job.password)) {
       filled = true;
       submittedAt = Date.now();
-      await log('账号密码已自动填写并提交，等待验证码或登录完成。');
+      await log('账号密码已自动填写并提交，正在检测验证码…');
     }
     if (!await loginDetected(tabId)) {
       await log('登录完成，继续当前任务。');
       return;
     }
+    if (filled) await handleCaptchaIfPresent(tabId);
     if (filled && !warned && Date.now() - submittedAt > 8_000) {
       warned = true;
       await log('登录按钮已触发但网页无响应：请暂停广告/脚本拦截扩展对 gsxt.gov.cn 和 shiming.gsxt.gov.cn 的拦截，然后刷新登录页。');
@@ -201,7 +202,228 @@ async function submitSearch(tabId, company) {
     return true;
   }, [company]);
   if (!result) throw new Error('找不到企业查询框或查询按钮');
-  await log('查询已提交；如出现验证码，请在 Chrome 中手动完成。');
+  await log('查询已提交，正在检测验证码…');
+}
+
+// ---------------------------------------------------------------------------
+// Geetest slide captcha auto-solver
+// ---------------------------------------------------------------------------
+
+// One attempt: find the panel, read canvas pixels, locate gap, simulate drag.
+// Returns {status:'solved'|'not_found'|'need_retry'|'no_canvas'|'no_slider_btn'|'canvas_error', gapX?, dragDist?}
+async function tryAutoSolveCaptcha(tabId) {
+  return execute(tabId, async () => {
+    // 1. Locate the captcha panel
+    const panel = ['[class*="geetest_panel"]', '[class*="geetest_wrap"]', '[class*="geetest_holder"]']
+      .map(s => document.querySelector(s))
+      .find(el => el && el.offsetParent !== null);
+    if (!panel) return { status: 'not_found' };
+
+    // 2. Find canvases; wait up to 3 s for images to paint (non-blank canvas)
+    const waitForCanvas = async canvas => {
+      for (let i = 0; i < 30; i++) {
+        try {
+          const d = canvas.getContext('2d').getImageData(0, 0, canvas.width, 1).data;
+          if (d.some(v => v !== 0)) return true;
+        } catch (_) { return false; }
+        await new Promise(r => setTimeout(r, 100));
+      }
+      return false;
+    };
+
+    const allCanvases = [...panel.querySelectorAll('canvas')].filter(c => c.width > 50 && c.height > 30);
+    if (allCanvases.length < 2) return { status: 'no_canvas' };
+
+    // Prefer canvas whose class says "bg" but not "fullbg"
+    const bgCanvas = allCanvases.find(c => /\bbg\b|_bg/.test(c.className) && !/fullbg|full_bg/.test(c.className))
+      || allCanvases.find(c => c.width > 200) || allCanvases[0];
+    const fullBgCanvas = allCanvases.find(c => /fullbg|full_bg/.test(c.className));
+    const pieceCanvas = allCanvases.find(c => /slice|piece|chunk|fragment/.test(c.className) && c !== bgCanvas)
+      || allCanvases.find(c => c !== bgCanvas && c !== fullBgCanvas && c.width < 100);
+
+    if (!await waitForCanvas(bgCanvas)) return { status: 'canvas_blank' };
+
+    // 3. Compute gap column scores
+    let gapX = 0;
+    try {
+      const w = bgCanvas.width, h = bgCanvas.height;
+      const bgData = bgCanvas.getContext('2d').getImageData(0, 0, w, h).data;
+
+      let fullData = null;
+      if (fullBgCanvas && await waitForCanvas(fullBgCanvas)) {
+        try { fullData = fullBgCanvas.getContext('2d').getImageData(0, 0, w, h).data; } catch (_) {}
+      }
+
+      const raw = new Float32Array(w);
+
+      if (fullData) {
+        // High-accuracy: direct pixel diff between bg-with-hole and full background
+        for (let x = 0; x < w; x++) {
+          let s = 0;
+          for (let y = 0; y < h; y++) {
+            const i = (y * w + x) * 4;
+            s += Math.abs(bgData[i] - fullData[i]) + Math.abs(bgData[i+1] - fullData[i+1]) + Math.abs(bgData[i+2] - fullData[i+2]);
+          }
+          raw[x] = s;
+        }
+      } else {
+        // Fallback: count pixels where horizontal brightness difference crosses threshold (gap edge)
+        for (let x = 2; x < w - 2; x++) {
+          let edgeScore = 0, shadowScore = 0;
+          for (let y = 0; y < h; y++) {
+            const i = (y * w + x) * 4, il = (y * w + x - 2) * 4;
+            const diff = Math.abs(bgData[i] - bgData[il]) + Math.abs(bgData[i+1] - bgData[il+1]) + Math.abs(bgData[i+2] - bgData[il+2]);
+            if (diff > 60) edgeScore++;
+            // Geetest draws a darker shadow just to the left of the gap
+            const brightness = bgData[i] + bgData[i+1] + bgData[i+2];
+            const lBrightness = bgData[il] + bgData[il+1] + bgData[il+2];
+            if (lBrightness - brightness > 60) shadowScore++;
+          }
+          raw[x] = edgeScore * 1.5 + shadowScore;
+        }
+      }
+
+      // Smooth scores with a 3-wide window, then find peak beyond x=40 (initial piece zone)
+      const scores = new Float32Array(w);
+      for (let x = 1; x < w - 1; x++) scores[x] = (raw[x-1] + raw[x] + raw[x+1]) / 3;
+
+      let maxScore = 0;
+      for (let x = 40; x < w - 15; x++) {
+        if (scores[x] > maxScore) { maxScore = scores[x]; gapX = x; }
+      }
+    } catch (e) {
+      return { status: 'canvas_error', detail: e.message };
+    }
+    if (gapX < 15) return { status: 'detection_failed' };
+
+    // Adjust for piece width so the right-hand edge of the piece aligns with the gap
+    let pieceW = 0;
+    if (pieceCanvas) {
+      try {
+        const pd = pieceCanvas.getContext('2d').getImageData(0, 0, pieceCanvas.width, pieceCanvas.height).data;
+        // Find rightmost non-transparent column
+        for (let x = pieceCanvas.width - 1; x >= 0; x--) {
+          let hasPixel = false;
+          for (let y = 0; y < pieceCanvas.height; y++) {
+            if (pd[(y * pieceCanvas.width + x) * 4 + 3] > 20) { hasPixel = true; break; }
+          }
+          if (hasPixel) { pieceW = x + 1; break; }
+        }
+      } catch (_) {}
+    }
+    // Use ~10% of piece width as correction; cap at 15px to avoid over-correction
+    const pieceCorrection = Math.min(Math.round((pieceW || 0) * 0.1), 15);
+
+    // 4. Find the slider button
+    let btn = null;
+    for (const sel of ['[class*="geetest_slider_button"]', '[class*="geetest_slide_btn"]', '[class*="geetest_btn"]', '[class*="slider-btn"]']) {
+      const el = panel.querySelector(sel);
+      if (el && el.offsetParent !== null) { btn = el; break; }
+    }
+    if (!btn) {
+      btn = [...panel.querySelectorAll('*')].find(el =>
+        el.offsetParent !== null && getComputedStyle(el).cursor === 'move' && el.tagName !== 'CANVAS'
+      );
+    }
+    if (!btn) return { status: 'no_slider_btn' };
+
+    // 5. Compute drag distance (canvas-pixel space → screen space, corrected for piece width)
+    const bgRect = bgCanvas.getBoundingClientRect();
+    const btnRect = btn.getBoundingClientRect();
+    const scaleX = bgRect.width / bgCanvas.width;
+    const startX = btnRect.left + btnRect.width / 2;
+    const startY = btnRect.top + btnRect.height / 2;
+    const targetScreenX = bgRect.left + (gapX - pieceCorrection) * scaleX;
+    const dragDist = targetScreenX - startX;
+    if (dragDist < 4) return { status: 'drag_too_small', gapX, dragDist: Math.round(dragDist) };
+
+    // 6. Human-like drag: accelerate then ease out, with per-step micro-jitter
+    const STEPS = 38 + Math.floor(Math.random() * 8);
+    // Ease-in (0→0.5) then ease-out (0.5→1), with very slight overshoot at 0.9
+    const easeProgress = t => {
+      if (t < 0.5) return 2.2 * t * t;
+      if (t < 0.88) return 1 - Math.pow(-2 * t + 2, 2) / 2;
+      return 1 + (1 - t) * 0.06; // minimal overshoot
+    };
+
+    btn.dispatchEvent(new MouseEvent('mousedown', {
+      bubbles: true, cancelable: true, clientX: startX, clientY: startY, buttons: 1
+    }));
+
+    await new Promise(resolve => {
+      let step = 0;
+      const tick = () => {
+        step++;
+        const t = step / STEPS;
+        const jitterX = (Math.random() - 0.5) * 1.8;
+        const jitterY = (Math.random() - 0.5) * 1.0;
+        const x = startX + dragDist * easeProgress(Math.min(t, 1)) + jitterX;
+        const y = startY + jitterY;
+        document.dispatchEvent(new MouseEvent('mousemove', {
+          bubbles: true, cancelable: true, clientX: x, clientY: y, buttons: 1
+        }));
+        if (step < STEPS) {
+          // Variable interval: faster in mid-drag, slower at start/end
+          const interval = t < 0.15 || t > 0.85 ? 22 + Math.random() * 12 : 12 + Math.random() * 8;
+          setTimeout(tick, interval);
+        } else {
+          setTimeout(() => {
+            document.dispatchEvent(new MouseEvent('mouseup', {
+              bubbles: true, cancelable: true, clientX: startX + dragDist, clientY: startY
+            }));
+            resolve();
+          }, 90 + Math.random() * 60);
+        }
+      };
+      setTimeout(tick, 80 + Math.random() * 40);
+    });
+
+    // Wait 1.5 s, then check if captcha is still visible (→ failure/retry needed)
+    await new Promise(r => setTimeout(r, 1500));
+    if (panel.offsetParent !== null) {
+      // Click the refresh icon if available so next attempt gets a fresh image
+      const refresh = panel.querySelector('[class*="geetest_refresh"],[class*="geetest_reload"],[class*="geetest_reset"]');
+      if (refresh && refresh.offsetParent !== null) {
+        refresh.click();
+        await new Promise(r => setTimeout(r, 800));
+      }
+      return { status: 'need_retry', gapX, dragDist: Math.round(dragDist) };
+    }
+
+    return { status: 'solved', gapX, dragDist: Math.round(dragDist) };
+  }).catch(err => ({ status: 'error', detail: String(err) }));
+}
+
+// Retries up to MAX_TRIES times; returns true when captcha is gone, false when giving up.
+async function handleCaptchaIfPresent(tabId, maxTries = 4) {
+  let attempt = 0;
+  while (attempt < maxTries) {
+    const result = await tryAutoSolveCaptcha(tabId);
+    if (!result || result.status === 'not_found') return false;
+
+    if (result.status === 'solved') {
+      await log(`已自动完成滑动验证码（第 ${attempt + 1} 次，拖动 ${result.dragDist}px）。`);
+      await sleep(500);
+      return true;
+    }
+    if (result.status === 'need_retry') {
+      attempt++;
+      await log(`验证码滑动未通过（第 ${attempt} 次），已刷新图片，重试中…`);
+      await sleep(1200);
+      continue;
+    }
+    // canvas_blank: images not yet painted, wait a moment and retry
+    if (result.status === 'canvas_blank') {
+      await sleep(1000);
+      attempt++;
+      continue;
+    }
+    // Unrecoverable failures
+    await log(`验证码自动识别失败（${result.status}${result.detail ? '：' + result.detail : ''}），请在 Chrome 中手动完成滑动。`);
+    return false;
+  }
+  await log(`验证码自动滑动已重试 ${maxTries} 次仍未通过，请手动完成。`);
+  return false;
 }
 
 async function prepareHomeTab() {
@@ -373,9 +595,12 @@ async function searchCompany(company, job) {
           if (blankState === 'reloaded') break;
           await sleep(1000);
         }
-      } else if (!announced) {
-        announced = true;
-        await log('正在等待查询结果或手动验证码…');
+      } else {
+        if (!announced) {
+          announced = true;
+          await log('正在等待查询结果，尝试自动识别验证码…');
+        }
+        await handleCaptchaIfPresent(tabId);
       }
       await sleep(1000);
     }
@@ -535,7 +760,7 @@ async function runBatch(job) {
   if (job.disabledExtensions?.length) {
     await log(`已临时停用冲突扩展：${job.disabledExtensions.join('、')}；任务结束后自动恢复。`);
   }
-  await log(`开始批量任务；输出到“下载/${outputRoot}”`);
+  await log(`开始批量任务；输出到"下载/${outputRoot}"`);
   try {
     for (let index = 0; index < job.companies.length; index++) {
       const company = job.companies[index];
