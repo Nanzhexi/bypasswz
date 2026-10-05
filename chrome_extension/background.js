@@ -331,7 +331,7 @@ async function solveGeetestSlide() {
         if (d[(y * sw + x) * 4 + 3] > 110) { us.push(x - x0); vs.push(y); }
       }
     }
-    mask = { x0, w: x1 - x0 + 1, us, vs };
+    if (us.length >= 150) mask = { x0, w: x1 - x0 + 1, us, vs };
   }
 
   // --- 2. Geometry: canvas pixels <-> screen pixels --------------------------------------------
@@ -524,9 +524,22 @@ async function solveGeetestSlide() {
   }
   if (!btn) return { status: 'no_slider_btn', diag: { ...diag, dom: domSummary() } };
 
+  // Screen x of the piece's left edge: where the slice canvas sits plus where the piece is drawn in it,
+  // so it works whether the widget moves the canvas or repaints the piece inside it.
+  const sliceEdge = () => {
+    try {
+      const w = sliceCanvas.width, h = sliceCanvas.height;
+      const d = sliceCanvas.getContext('2d').getImageData(0, 0, w, h).data;
+      for (let col = 0; col < w; col++) {
+        for (let row = 0; row < h; row++) if (d[(row * w + col) * 4 + 3] > 110) return col;
+      }
+    } catch (_) { /* use the resting position below */ }
+    return null;
+  };
   const pieceLeft = () => {
-    const rect = sliceCanvas ? sliceCanvas.getBoundingClientRect() : null;
-    return rect ? rect.left + (mask ? mask.x0 : 6) * ssx : bgRect.left + 6 * sx;
+    if (!sliceCanvas) return bgRect.left + 6 * sx;
+    const edge = sliceEdge();
+    return sliceCanvas.getBoundingClientRect().left + (edge === null ? (mask ? mask.x0 : 6) : edge) * ssx;
   };
   const targetLeft = bgRect.left + gapL * sx;
   const startPiece = pieceLeft();
@@ -561,9 +574,9 @@ async function solveGeetestSlide() {
   fire('mousedown', startX, startY, 1, btn);
   await sleep(between(80, 200));
 
-  let ratio = 1, travel = need, calibrated = false;
+  let ratio = 1, travel = need, calibrated = false, tracking = Boolean(sliceCanvas);
   const steps = Math.round(between(30, 44));
-  const overshoot = Math.random() < 0.6 ? between(1.5, 5) : 0;
+  let overshoot = sliceCanvas && Math.random() < 0.6 ? between(1.5, 5) : 0;
   const ease = t => { const u = Math.pow(t, 0.9); return u * u * u * (u * (u * 6 - 15) + 10); };
   for (let i = 1; i <= steps; i++) {
     const t = i / steps;
@@ -572,17 +585,25 @@ async function solveGeetestSlide() {
     await sleep(t < 0.15 || t > 0.85 ? between(22, 36) : between(12, 22));
     if (!calibrated && sliceCanvas && t >= 0.3 && x - startX > 12) {
       const moved = pieceLeft() - startPiece, mouse = x - startX;
-      if (Math.abs(moved) < 1 && mouse > 25) {
-        fire('mouseup', x, y, 0);
-        diag.moved = +moved.toFixed(1);
-        return { status: 'no_response', diag };
+      const buttonMoved = btn.getBoundingClientRect().left - btnRect.left;
+      if (Math.abs(moved) < 1) {
+        if (Math.abs(buttonMoved) < 1 && mouse > 25) {
+          fire('mouseup', x, y, 0);
+          diag.moved = +moved.toFixed(1);
+          return { status: 'no_response', diag };
+        }
+        // The slider follows the mouse but the slice canvas does not: the widget moves the piece some
+        // other way, so keep dragging by the computed distance without feedback.
+        if (Math.abs(buttonMoved) >= 1) { tracking = false; overshoot = 0; diag.openLoop = true; }
+      } else if (moved / mouse > 0.6 && moved / mouse < 1.6) {
+        ratio = moved / mouse;
+        travel = need / ratio;
       }
-      if (moved / mouse > 0.6 && moved / mouse < 1.6) { ratio = moved / mouse; travel = need / ratio; }
       calibrated = true;
     }
   }
   let corrections = 0;
-  while (sliceCanvas && corrections < 6) {
+  while (tracking && corrections < 6) {
     await sleep(between(70, 150));
     const error = targetLeft - pieceLeft();
     if (Math.abs(error) <= 0.8) break;
@@ -596,7 +617,7 @@ async function solveGeetestSlide() {
   await sleep(between(120, 320));
   diag.ratio = +ratio.toFixed(3);
   diag.corrections = corrections;
-  diag.finalErr = sliceCanvas ? +(targetLeft - pieceLeft()).toFixed(1) : null;
+  diag.finalErr = tracking ? +(targetLeft - pieceLeft()).toFixed(1) : null;
   fire('mouseup', x, y, 0);
 
   // --- 6. What did the widget do? ------------------------------------------------------------
@@ -675,6 +696,7 @@ async function handleCaptchaIfPresent(tabId, maxTries = 3) {
     const result = await tryAutoSolveCaptcha(tabId);
     const status = result?.status;
     if (!status || status === 'not_found') return false;
+    if (status === 'solved' && result.diag?.note === 'already verified') return false;
     if (status === 'solved') {
       captchaFailures = 0;
       await log(`滑动验证码已通过${result.dragDist ? `（拖动约 ${result.dragDist}px）` : ''}${describeCaptcha(result)}。`);

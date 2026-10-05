@@ -3,6 +3,8 @@
 // listens for mousedown, document-level mousemove / mouseup) and judges the drop position
 // geometrically. It cannot model Geetest's server-side behaviour analysis, so a pass here proves
 // alignment and event flow only, not acceptance by the real service.
+// Opt-in variants (MOCK='{"moveMode":"repaint","sliceMode":"full"}'): "repaint" redraws the piece inside a
+// static slice canvas, "other" leaves the slice canvas still and moves a separate element instead.
 
 export function mockOptions(seed, overrides = {}) {
   let s = (Math.imul(seed + 1, 2654435761) >>> 0);
@@ -55,7 +57,8 @@ function widgetMain(opts) {
   const tip = panel.querySelector('.geetest_result_tip');
   const slider = panel.querySelector('.geetest_slider');
   const refreshEl = panel.querySelector('.geetest_refresh_1');
-  let ready = false, puzzle = null, drag = null, sliceLeft = 0;
+  const viewPiece = panel.querySelector('.geetest_piece_view');
+  let ready = false, puzzle = null, drag = null, sliceLeft = 0, current = null;
 
   const canvasOf = (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; };
   const addNoise = (g, w, h, amount) => {
@@ -139,9 +142,21 @@ function widgetMain(opts) {
     return { pic, shape, gapX: ri(64, W - shape.w - 8), gapY: ri(4, H - shape.h - 4) };
   };
 
+  const drawPiece = () => {
+    if (!current) return;
+    const sg = slice.getContext('2d');
+    sg.clearRect(0, 0, slice.width, slice.height);
+    sg.save();
+    sg.shadowColor = 'rgba(255,255,255,0.9)';
+    sg.shadowBlur = 2;
+    sg.drawImage(current.piece, opts.inset + (opts.moveMode === 'repaint' ? sliceLeft : 0), current.y);
+    sg.restore();
+  };
   const apply = dist => {
     sliceLeft = dist * opts.sliceRatio;
-    if (sliceWrap) sliceWrap.style.transform = `translateX(${sliceLeft}px)`;
+    if (opts.moveMode === 'repaint') drawPiece();
+    else if (opts.moveMode === 'other') viewPiece.style.left = `${opts.inset + sliceLeft}px`;
+    else if (sliceWrap) sliceWrap.style.transform = `translateX(${sliceLeft}px)`;
     else slice.style.left = `${sliceLeft}px`;
     btn.style.transform = `translateX(${dist}px)`;
     track.style.width = `${dist + 25}px`;
@@ -176,12 +191,15 @@ function widgetMain(opts) {
     gp.drawImage(p.shape.canvas, 0, 0);
     gp.globalCompositeOperation = 'source-in';
     gp.drawImage(p.pic, p.gapX, p.gapY, p.shape.w, p.shape.h, 0, 0, p.shape.w, p.shape.h);
-    const sg = slice.getContext('2d');
-    sg.save();
-    sg.shadowColor = 'rgba(255,255,255,0.9)';
-    sg.shadowBlur = 2;
-    sg.drawImage(piece, opts.inset, opts.sliceMode === 'small' ? 2 : p.gapY);
-    sg.restore();
+    current = { piece, y: opts.sliceMode === 'small' ? 2 : p.gapY };
+    drawPiece();
+    if (opts.moveMode === 'other') {
+      slice.style.visibility = 'hidden';
+      viewPiece.style.backgroundImage = `url(${piece.toDataURL()})`;
+      viewPiece.style.width = `${p.shape.w}px`;
+      viewPiece.style.height = `${p.shape.h}px`;
+      viewPiece.style.top = `${p.gapY}px`;
+    }
   };
 
   if (!opts.hasFullbg) full.remove();
@@ -267,6 +285,7 @@ export function widgetHtml(opts) {
   const { W, H } = opts;
   const sliceTag = `<canvas class="geetest_canvas_slice geetest_absolute" width="${W}" height="${H}"></canvas>`;
   const sliceBlock = opts.moveMode === 'transform' ? `<div class="geetest_slice geetest_absolute">${sliceTag}</div>` : sliceTag;
+  const otherView = opts.moveMode === 'other' ? '<div class="geetest_piece_view geetest_absolute" style="background-size:100% 100%"></div>' : '';
   return `<style>
 .geetest_absolute { position: absolute; left: 0; top: 0; }
 .geetest_panel { display: none; position: ${opts.panelPosition}; left: 50%; top: 60px; margin-left: -150px; z-index: 99999; width: ${W + 30}px; padding: 15px; background: #fff; border: 1px solid #ccc; border-radius: 6px; box-shadow: 0 2px 10px rgba(0,0,0,.3);${opts.scale !== 1 ? ` transform: scale(${opts.scale}); transform-origin: top left;` : ''} }
@@ -282,7 +301,7 @@ export function widgetHtml(opts) {
   <div class="geetest_window">
     <div class="geetest_slicebg geetest_absolute">
       <canvas class="geetest_canvas_bg geetest_absolute" width="${W}" height="${H}"></canvas>
-      ${sliceBlock}
+      ${sliceBlock}${otherView}
     </div>
     <canvas class="geetest_canvas_fullbg geetest_fade geetest_absolute" width="${W}" height="${H}" style="display:none"></canvas>
     <a class="geetest_refresh_1" href="javascript:;"></a>
