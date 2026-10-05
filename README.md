@@ -12,6 +12,8 @@ npm run install:browser
 npm test
 npm run test:browser
 npm run test:archive
+npm run test:captcha
+GSXT_MOCK_CAPTCHA=1 npm run test:archive
 ```
 
 在 Chrome 扩展管理页面启用开发者模式，加载 `chrome_extension`。
@@ -24,7 +26,8 @@ npm run test:archive
 - Mac 基础、浏览器及模拟归档测试通过：44 个栏目、12 张 PNG。
 - 真实官网登录与企业详情访问已验证。
 - 真实完整归档尚未验证成功；现有截图存在目录布局问题。
-- 验证码仍需交互处理，未实现无人值守验证码识别。
+- 滑块验证码：已实现自动识别并拖动（Geetest 滑块；每次尝试都会实时测量拼图位置并微调，失败自动换图重试，连续失败 6 次后暂停并提示手动完成）。模拟页面测试已通过，**尚未在真实官网验证**；模拟测试只能验证对位与事件流程，无法验证 Geetest 服务端的行为风控。
+- 自动滑动期间请让 GSXT 标签页保持在前台，浏览器窗口不要最小化或被完全遮挡，否则浏览器会限制定时器，拖动会变慢。
 - 当前产物为 PNG；PDF 和原生日期/网址页眉页脚尚未实现。
 
 最新代码优先复用名称完全匹配的已打开企业详情，并优先点击官网栏目导航的叶子控件。

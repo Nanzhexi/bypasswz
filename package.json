@@ -6,6 +6,7 @@
     "test": "node test_extension_handshake.cjs && node test_blocker_management.cjs && node test_extension_source_guard.cjs",
     "test:browser": "node test_extension_browser_smoke.mjs && node test_extension_no_reload.mjs",
     "test:archive": "node test_extension_archive_smoke.mjs",
+    "test:captcha": "node test_captcha_solver.mjs",
     "install:browser": "playwright-core install chromium"
   },
   "dependencies": {
