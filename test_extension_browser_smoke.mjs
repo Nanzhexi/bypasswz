@@ -28,7 +28,7 @@ try {
   popup.on('pageerror', error => errors.push(error.message));
   await popup.goto(`chrome-extension://${extensionId}/popup.html`);
   const version = await popup.evaluate(() => chrome.runtime.getManifest().version);
-  if (version !== '1.7.7') throw new Error(`loaded version ${version}`);
+  if (version !== '1.7.8') throw new Error(`loaded version ${version}`);
   await popup.evaluate(() => chrome.storage.local.set({ runStatus: { running: true, text: '旧任务状态' } }));
   await popup.locator('#start').filter({ hasText: '任务执行中' }).waitFor();
   if (!await popup.locator('#start').isEnabled()) throw new Error('stale running state disabled the start button');

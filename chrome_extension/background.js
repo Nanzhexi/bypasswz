@@ -25,7 +25,7 @@ let outputRoot = '';
 let messages = [];
 let workTabId = null;
 
-chrome.storage.local.set({ engineVersion: '1.7.7' }).catch(() => {});
+chrome.storage.local.set({ engineVersion: '1.7.8' }).catch(() => {});
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
