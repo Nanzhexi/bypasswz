@@ -23,9 +23,10 @@ let running = false;
 let activeJob = null;
 let outputRoot = '';
 let messages = [];
+let fullLog = [];
 let workTabId = null;
 
-chrome.storage.local.set({ engineVersion: '1.7.7' }).catch(() => {});
+chrome.storage.local.set({ engineVersion: '1.7.8' }).catch(() => {});
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -42,7 +43,35 @@ async function resetGsxtCheck() {
 async function log(message) {
   messages.push(message);
   messages = messages.slice(-100);
+  fullLog.push(`${new Date().toLocaleTimeString('sv-SE')} ${message}`);
+  fullLog = fullLog.slice(-3000);
   await chrome.storage.local.set({ runStatus: { running, text: messages.join('\n') } });
+}
+
+// Keeps a timestamped copy of the whole run log next to the screenshots, so the outcome (for example
+// how a captcha went) can be read from disk without copying it out of the runner page.
+async function saveRunLog(lastLine) {
+  if (!outputRoot) return;
+  const lines = [...fullLog];
+  if (lastLine) lines.push(`${new Date().toLocaleTimeString('sv-SE')} ${lastLine}`);
+  const id = await chrome.downloads.download({
+    url: `data:text/plain;charset=utf-8,${encodeURIComponent(`${lines.join('\n')}\n`)}`,
+    filename: `${outputRoot}/运行日志.txt`,
+    conflictAction: 'uniquify',
+    saveAs: false
+  });
+  await new Promise(resolve => {
+    let timer;
+    const finish = () => {
+      clearTimeout(timer);
+      chrome.downloads.onChanged.removeListener(onChanged);
+      resolve();
+    };
+    const onChanged = delta => { if (delta.id === id && delta.state && delta.state.current !== 'in_progress') finish(); };
+    timer = setTimeout(finish, 5000);
+    chrome.downloads.onChanged.addListener(onChanged);
+    chrome.downloads.search({ id }).then(([item]) => { if (item && item.state !== 'in_progress') finish(); }, finish);
+  });
 }
 
 const safeName = value => String(value).replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').replace(/[. ]+$/, '').slice(0, 100) || 'unnamed';
@@ -162,8 +191,9 @@ async function tryAutoLogin(tabId, username, password) {
 }
 
 async function handleLogin(tabId, job) {
+  resetCaptchaState();
   tabId = await openLoginPrompt(tabId);
-  await log('检测到登录页，正在填写账号密码；如出现验证码，请手动完成。');
+  await log('检测到登录页，正在填写账号密码…');
   const deadline = Date.now() + 10 * 60_000;
   let filled = false;
   let submittedAt = 0;
@@ -172,12 +202,13 @@ async function handleLogin(tabId, job) {
     if (!filled && await tryAutoLogin(tabId, job.username, job.password)) {
       filled = true;
       submittedAt = Date.now();
-      await log('账号密码已自动填写并提交，等待验证码或登录完成。');
+      await log('账号密码已自动填写并提交，正在检测验证码…');
     }
     if (!await loginDetected(tabId)) {
       await log('登录完成，继续当前任务。');
       return;
     }
+    if (filled) await handleCaptchaIfPresent(tabId);
     if (filled && !warned && Date.now() - submittedAt > 8_000) {
       warned = true;
       await log('登录按钮已触发但网页无响应：请暂停广告/脚本拦截扩展对 gsxt.gov.cn 和 shiming.gsxt.gov.cn 的拦截，然后刷新登录页。');
@@ -201,7 +232,535 @@ async function submitSearch(tabId, company) {
     return true;
   }, [company]);
   if (!result) throw new Error('找不到企业查询框或查询按钮');
-  await log('查询已提交；如出现验证码，请在 Chrome 中手动完成。');
+  await log('查询已提交，正在检测验证码…');
+}
+
+// ---------------------------------------------------------------------------
+// Geetest slide captcha auto-solver
+// ---------------------------------------------------------------------------
+
+// Runs inside the GSXT page through chrome.scripting.executeScript, so it must stay self-contained.
+// One call is one attempt: read the bg / fullbg / slice canvases, locate the gap, drag the slider
+// while measuring where the piece really is (closed loop), then report what the widget did.
+async function solveGeetestSlide() {
+  const started = Date.now();
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const between = (min, max) => min + Math.random() * (max - min);
+  const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+  const classOf = el => String(el.getAttribute('class') || '');
+  // offsetParent is null for position:fixed popups, so test visibility from computed style and geometry.
+  const shown = el => {
+    if (!el || !el.isConnected || getComputedStyle(el).visibility === 'hidden') return false;
+    for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
+      const style = getComputedStyle(node);
+      if (style.display === 'none' || Number(style.opacity) < 0.05) return false;
+    }
+    const rect = el.getBoundingClientRect();
+    return rect.width > 4 && rect.height > 4;
+  };
+
+  const panel = [...document.querySelectorAll('[class*="geetest_panel"],[class*="geetest_holder"],[class*="geetest_wrap"],[class*="geetest_widget"]')].find(shown);
+  if (!panel) return { status: 'not_found' };
+  const verified = () => panel.classList.contains('geetest_success')
+    || [...panel.querySelectorAll('.geetest_success,.geetest_panel_success')].some(shown);
+  if (verified()) return { status: 'solved', diag: { note: 'already verified' } };
+
+  const canvases = [...panel.querySelectorAll('canvas')];
+  // Compact description of what the widget looks like, for logs when it cannot be recognised.
+  const domSummary = () => {
+    const tokens = new Set();
+    for (const el of panel.querySelectorAll('*')) {
+      for (const token of classOf(el).split(/\s+/)) if (/geetest|slide|slider|captcha|verify/i.test(token)) tokens.add(token);
+    }
+    const sizes = canvases.map(c => `${classOf(c).split(/\s+/)[0] || 'canvas'}:${c.width}x${c.height}`).join(',');
+    return `画布[${sizes}] 类名[${[...tokens].slice(0, 24).join(' ')}]`.slice(0, 420);
+  };
+  const fullCanvas = canvases.find(c => /full[_-]?bg/i.test(classOf(c)));
+  const sliceCanvas = canvases.find(c => /slice|piece|puzzle|jigsaw/i.test(classOf(c)));
+  const bgCanvas = canvases.find(c => c !== fullCanvas && c !== sliceCanvas && /(^|[\s_-])bg(\s|$)/i.test(classOf(c)))
+    || canvases.filter(c => c !== fullCanvas && c !== sliceCanvas && c.width >= 100)
+      .sort((a, b) => b.width * b.height - a.width * a.height)[0];
+  if (!bgCanvas) {
+    const radar = panel.querySelector('[class*="geetest_radar_tip"]');
+    if (radar && shown(radar)) { radar.click(); return { status: 'clicked_radar' }; }
+    return { status: 'no_canvas', diag: { dom: domSummary() } };
+  }
+
+  // --- 1. Read pixels once the images have been painted and stopped changing -----------------
+  const W = bgCanvas.width, H = bgCanvas.height, px = W * H;
+  const read = (canvas, w = canvas.width, h = canvas.height) => {
+    if (canvas.width === w && canvas.height === h) return canvas.getContext('2d').getImageData(0, 0, w, h);
+    const tmp = document.createElement('canvas');
+    tmp.width = w; tmp.height = h;
+    const g = tmp.getContext('2d');
+    g.drawImage(canvas, 0, 0, w, h);
+    return g.getImageData(0, 0, w, h);
+  };
+  const paintedRatio = data => {
+    let hit = 0, n = 0;
+    for (let i = 3; i < data.length; i += 44) { n++; if (data[i] > 0) hit++; }
+    return n ? hit / n : 0;
+  };
+  const opaqueCount = data => {
+    let n = 0;
+    for (let i = 3; i < data.length; i += 4) if (data[i] > 40) n++;
+    return n;
+  };
+  const digest = data => {
+    let h = 0;
+    for (let i = 0; i < data.length; i += 37) h = (Math.imul(h, 31) + data[i]) | 0;
+    return h;
+  };
+  const bgSignature = () => { try { return digest(read(bgCanvas).data); } catch (_) { return 0; } };
+  // Ask the widget for a fresh puzzle (used when this one cannot be solved); true when a refresh control was clicked.
+  const refreshPuzzle = async () => {
+    const before = bgSignature();
+    const control = [...panel.querySelectorAll('[class*="geetest_refresh"],[class*="geetest_reload"]')].find(shown);
+    if (!control) return false;
+    control.click();
+    for (let i = 0; i < 25 && bgSignature() === before; i++) await sleep(100);
+    return true;
+  };
+  let bgImg, fullImg = null, sliceImg = null, lastSignature = '';
+  for (let round = 0; ; round++) {
+    try {
+      bgImg = read(bgCanvas);
+      fullImg = fullCanvas ? read(fullCanvas, W, H) : null;
+      sliceImg = sliceCanvas ? read(sliceCanvas) : null;
+    } catch (error) {
+      return { status: 'canvas_error', detail: String((error && error.message) || error) };
+    }
+    const coreReady = paintedRatio(bgImg.data) > 0.9 && (!fullImg || paintedRatio(fullImg.data) > 0.9);
+    const sliceReady = !sliceImg || opaqueCount(sliceImg.data) > 150;
+    const signature = `${digest(bgImg.data)}:${fullImg ? digest(fullImg.data) : 0}:${sliceImg ? digest(sliceImg.data) : 0}`;
+    if (coreReady && (sliceReady || round >= 15) && signature === lastSignature) break;
+    lastSignature = coreReady ? signature : '';
+    if (round >= 40) return { status: 'canvas_blank' };
+    await sleep(150);
+  }
+
+  // Piece silhouette (alpha mask) from the slice canvas.
+  let mask = null;
+  if (sliceImg && opaqueCount(sliceImg.data) > 150) {
+    const sw = sliceCanvas.width, sh = sliceCanvas.height, d = sliceImg.data;
+    let x0 = sw, x1 = -1, y0 = sh, y1 = -1;
+    for (let y = 0; y < sh; y++) {
+      for (let x = 0; x < sw; x++) {
+        if (d[(y * sw + x) * 4 + 3] > 110) {
+          if (x < x0) x0 = x;
+          if (x > x1) x1 = x;
+          if (y < y0) y0 = y;
+          if (y > y1) y1 = y;
+        }
+      }
+    }
+    const us = [], vs = [];
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        if (d[(y * sw + x) * 4 + 3] > 110) { us.push(x - x0); vs.push(y); }
+      }
+    }
+    if (us.length >= 150) mask = { x0, w: x1 - x0 + 1, us, vs };
+  }
+
+  // --- 2. Geometry: canvas pixels <-> screen pixels --------------------------------------------
+  const bgRect = bgCanvas.getBoundingClientRect();
+  const sx = bgRect.width / W, sy = bgRect.height / H;
+  const sliceRect0 = sliceCanvas ? sliceCanvas.getBoundingClientRect() : null;
+  const ssx = sliceRect0 ? sliceRect0.width / sliceCanvas.width : sx;
+  const ssy = sliceRect0 ? sliceRect0.height / sliceCanvas.height : sy;
+  const offX = sliceRect0 ? (sliceRect0.left - bgRect.left) / sx : 0;
+  const offY = sliceRect0 ? (sliceRect0.top - bgRect.top) / sy : 0;
+  const diag = { bg: `${W}x${H}`, full: Boolean(fullImg), slice: sliceCanvas ? `${sliceCanvas.width}x${sliceCanvas.height}` : null, mask: mask ? mask.us.length : 0 };
+
+  // --- 3. Locate the gap: left edge column (bg canvas px) where the piece's left edge must land ----
+  let gapL = -1, mode = '', conf = 0;
+  if (fullImg) {
+    const b = bgImg.data, f = fullImg.data;
+    const diffs = new Uint16Array(px), signed = new Int16Array(px), hist = new Uint32Array(766);
+    for (let p = 0, i = 0; p < px; p++, i += 4) {
+      const d = Math.abs(b[i] - f[i]) + Math.abs(b[i + 1] - f[i + 1]) + Math.abs(b[i + 2] - f[i + 2]);
+      diffs[p] = d;
+      signed[p] = (f[i] - b[i]) + (f[i + 1] - b[i + 1]) + (f[i + 2] - b[i + 2]);
+      hist[d]++;
+    }
+    // Noise floor from the bulk of unchanged pixels: median and MAD of the colour difference.
+    let acc = 0, median = 0, mad = 0;
+    for (let v = 0; v < 766; v++) { acc += hist[v]; if (acc >= px * 0.5) { median = v; break; } }
+    const dev = new Uint32Array(766);
+    for (let v = 0; v < 766; v++) dev[Math.abs(v - median)] += hist[v];
+    acc = 0;
+    for (let v = 0; v < 766; v++) { acc += dev[v]; if (acc >= px * 0.5) { mad = v; break; } }
+    const changed = Math.max(16, median + 4 * 1.4826 * mad);
+    const raw = new Uint8Array(px), diff = new Uint8Array(px);
+    for (let p = 0; p < px; p++) raw[p] = diffs[p] > changed ? 1 : 0;
+    for (let y = 1; y < H - 1; y++) {
+      for (let x = 1; x < W - 1; x++) {
+        const p = y * W + x;
+        const n = raw[p - W - 1] + raw[p - W] + raw[p - W + 1] + raw[p - 1] + raw[p] + raw[p + 1] + raw[p + W - 1] + raw[p + W] + raw[p + W + 1];
+        diff[p] = n >= 4 ? 1 : 0;
+      }
+    }
+    if (mask) {
+      // Slide the piece silhouette over an evidence map: reward evidence under the silhouette and
+      // penalise evidence next to it, so the best score is where the silhouette fills the hole.
+      const rsx = ssx / sx, rsy = ssy / sy;
+      const relX = mask.us.map(u => Math.round(u * rsx));
+      const relY = mask.vs.map(v => Math.round(offY + v * rsy));
+      let yMin = H, yMax = 0, mw = 0;
+      for (let k = 0; k < relX.length; k++) {
+        if (relY[k] < yMin) yMin = relY[k];
+        if (relY[k] > yMax) yMax = relY[k];
+        if (relX[k] > mw) mw = relX[k];
+      }
+      mw += 1;
+      const margin = 4;
+      const slide = evidence => {
+        const S = new Float64Array((W + 1) * (H + 1));
+        for (let y = 0; y < H; y++) {
+          let row = 0;
+          for (let x = 0; x < W; x++) {
+            row += evidence[y * W + x];
+            S[(y + 1) * (W + 1) + x + 1] = S[y * (W + 1) + x + 1] + row;
+          }
+        }
+        const boxSum = (x0, y0, x1, y1) => {
+          x0 = clamp(x0, 0, W); x1 = clamp(x1, 0, W); y0 = clamp(y0, 0, H); y1 = clamp(y1, 0, H);
+          return x1 > x0 && y1 > y0 ? S[y1 * (W + 1) + x1] - S[y0 * (W + 1) + x1] - S[y1 * (W + 1) + x0] + S[y0 * (W + 1) + x0] : 0;
+        };
+        let best = -Infinity, bestX = -1;
+        const scores = new Float64Array(W).fill(-Infinity);
+        for (let gx = 0; gx + mw <= W; gx++) {
+          let inside = 0;
+          for (let k = 0; k < relX.length; k++) {
+            const X = gx + relX[k], Y = relY[k];
+            if (X >= 0 && X < W && Y >= 0 && Y < H) inside += evidence[Y * W + X];
+          }
+          const score = 2 * inside - boxSum(gx - margin, yMin - margin, gx + mw + margin, yMax + 1 + margin);
+          scores[gx] = score;
+          if (score > best) { best = score; bestX = gx; }
+        }
+        let covered = 0;
+        for (let k = 0; k < relX.length; k++) {
+          const X = bestX + relX[k], Y = relY[k];
+          if (X >= 0 && X < W && Y >= 0 && Y < H) covered += diff[Y * W + X];
+        }
+        let runnerUp = -Infinity;
+        for (let gx = 0; gx < W; gx++) if (Math.abs(gx - bestX) > 12 && scores[gx] > runnerUp) runnerUp = scores[gx];
+        return { best, bestX, scores, conf: bestX >= 0 ? covered / relX.length : 0, rival: best > 0 ? runnerUp / best : null };
+      };
+      // First pass counts only "darker than the full picture" (the shaded hole) and ignores lighter
+      // pixels, so a pale rim around the hole can neither attract nor repel the silhouette; the second
+      // pass accepts any change.
+      const darker = new Float64Array(px), either = new Float64Array(px);
+      for (let p = 0; p < px; p++) {
+        darker[p] = clamp(signed[p], 0, 120);
+        either[p] = Math.min(diffs[p], 120) - median;
+      }
+      for (const [name, evidence] of [['mask-dark', darker], ['mask-diff', either]]) {
+        const found = slide(evidence);
+        if (found.bestX < 0 || found.best <= 0 || found.conf < 0.2) continue;
+        // Soft hole edges let several neighbouring offsets fit almost equally well; aim for the middle.
+        let lo = found.bestX, hi = found.bestX;
+        while (lo > 0 && found.scores[lo - 1] >= found.best * 0.97) lo--;
+        while (hi < W - 1 && found.scores[hi + 1] >= found.best * 0.97) hi++;
+        gapL = Math.round((lo + hi) / 2);
+        mode = name;
+        conf = found.conf;
+        diag.rival = found.rival === null ? null : +found.rival.toFixed(2);
+        break;
+      }
+    }
+    if (gapL < 0) {
+      // No usable silhouette: take the left edge of the changed region itself.
+      const cols = new Int32Array(W);
+      let maxCol = 0;
+      for (let x = 0; x < W; x++) {
+        let n = 0;
+        for (let y = 0; y < H; y++) n += diff[y * W + x];
+        cols[x] = n;
+        if (n > maxCol) maxCol = n;
+      }
+      const limit = Math.max(3, maxCol * 0.3);
+      if (maxCol >= 8) {
+        for (let x = 4; x < W - 3; x++) {
+          if (cols[x] >= limit && cols[x + 1] >= limit && cols[x + 2] >= limit) { gapL = x; mode = 'diff-edge'; conf = 0.5; break; }
+        }
+      }
+    }
+  } else if (mask) {
+    // No full background to compare with: look for the position where the silhouette sits on a
+    // region that is clearly darker than its surroundings (Geetest shades the hole).
+    const b = bgImg.data;
+    const L = new Float64Array(px);
+    for (let p = 0, i = 0; p < px; p++, i += 4) L[p] = 0.299 * b[i] + 0.587 * b[i + 1] + 0.114 * b[i + 2];
+    const S = new Float64Array((W + 1) * (H + 1));
+    for (let y = 0; y < H; y++) {
+      let row = 0;
+      for (let x = 0; x < W; x++) {
+        row += L[y * W + x];
+        S[(y + 1) * (W + 1) + x + 1] = S[y * (W + 1) + x + 1] + row;
+      }
+    }
+    const boxSum = (x0, y0, x1, y1) => {
+      x0 = clamp(x0, 0, W); x1 = clamp(x1, 0, W); y0 = clamp(y0, 0, H); y1 = clamp(y1, 0, H);
+      return x1 > x0 && y1 > y0 ? S[y1 * (W + 1) + x1] - S[y0 * (W + 1) + x1] - S[y1 * (W + 1) + x0] + S[y0 * (W + 1) + x0] : 0;
+    };
+    const rsx = ssx / sx, rsy = ssy / sy;
+    const relX = mask.us.map(u => Math.round(u * rsx));
+    const relY = mask.vs.map(v => Math.round(offY + v * rsy));
+    let yMin = H, yMax = 0, mw = 0;
+    for (let k = 0; k < relX.length; k++) {
+      if (relY[k] < yMin) yMin = relY[k];
+      if (relY[k] > yMax) yMax = relY[k];
+      if (relX[k] > mw) mw = relX[k];
+    }
+    mw += 1;
+    const margin = 5, startGx = Math.round(offX + mask.x0 * ssx / sx + 20);
+    let best = -Infinity, bestX = -1;
+    for (let gx = Math.max(0, startGx); gx + mw <= W; gx++) {
+      let inside = 0;
+      for (let k = 0; k < relX.length; k++) {
+        const X = gx + relX[k], Y = relY[k];
+        if (X >= 0 && X < W && Y >= 0 && Y < H) inside += L[Y * W + X];
+      }
+      inside /= relX.length;
+      const outer = boxSum(gx - margin, yMin - margin, gx + mw + margin, yMax + 1 + margin);
+      const inner = boxSum(gx, yMin, gx + mw, yMax + 1);
+      const ringArea = (mw + 2 * margin) * (yMax - yMin + 1 + 2 * margin) - mw * (yMax - yMin + 1);
+      const ring = (outer - inner) / Math.max(1, ringArea);
+      const score = (ring - inside) / (ring + 12);
+      if (score > best) { best = score; bestX = gx; }
+    }
+    conf = Math.max(0, best);
+    if (bestX >= 0 && best >= 0.12) { gapL = bestX; mode = 'mask-shadow'; }
+  }
+  Object.assign(diag, { mode, gapL, conf: +conf.toFixed(2) });
+  if (gapL < 0) {
+    await refreshPuzzle();
+    return { status: 'detection_failed', diag: { ...diag, dom: domSummary() } };
+  }
+
+  // --- 4. Slider button and where the piece has to travel --------------------------------------
+  let btn = null;
+  for (const selector of ['[class*="geetest_slider_button"]', '[class*="geetest_slide_btn"]', '[class*="slider_button"]', '[class*="slider-btn"]', '[class*="slide-btn"]', '[class*="geetest_btn"]']) {
+    btn = [...panel.querySelectorAll(selector)].find(shown);
+    if (btn) break;
+  }
+  if (!btn) {
+    btn = [...panel.querySelectorAll('*')].find(el => el.tagName !== 'CANVAS' && shown(el)
+      && /^(move|grab|ew-resize)$/.test(getComputedStyle(el).cursor));
+  }
+  if (!btn) return { status: 'no_slider_btn', diag: { ...diag, dom: domSummary() } };
+
+  // Screen x of the piece's left edge: where the slice canvas sits plus where the piece is drawn in it,
+  // so it works whether the widget moves the canvas or repaints the piece inside it.
+  const sliceEdge = () => {
+    try {
+      const w = sliceCanvas.width, h = sliceCanvas.height;
+      const d = sliceCanvas.getContext('2d').getImageData(0, 0, w, h).data;
+      for (let col = 0; col < w; col++) {
+        for (let row = 0; row < h; row++) if (d[(row * w + col) * 4 + 3] > 110) return col;
+      }
+    } catch (_) { /* use the resting position below */ }
+    return null;
+  };
+  const pieceLeft = () => {
+    if (!sliceCanvas) return bgRect.left + 6 * sx;
+    const edge = sliceEdge();
+    return sliceCanvas.getBoundingClientRect().left + (edge === null ? (mask ? mask.x0 : 6) : edge) * ssx;
+  };
+  const targetLeft = bgRect.left + gapL * sx;
+  const startPiece = pieceLeft();
+  const need = targetLeft - startPiece;
+  diag.need = +need.toFixed(1);
+  if (need < 3) {
+    await refreshPuzzle();
+    return { status: 'drag_too_small', diag };
+  }
+
+  // --- 5. Human-like drag, steered by the measured piece position -------------------------------
+  const btnRect = btn.getBoundingClientRect();
+  const startX = btnRect.left + btnRect.width * between(0.35, 0.65);
+  const startY = btnRect.top + btnRect.height * between(0.35, 0.65);
+  const fire = (type, x, y, buttons, target) => {
+    const el = target || document.elementFromPoint(x, y) || document.body;
+    el.dispatchEvent(new MouseEvent(type, {
+      bubbles: type !== 'mouseenter', cancelable: true, composed: true, view: window,
+      clientX: x, clientY: y, screenX: x + window.screenX, screenY: y + window.screenY + 85,
+      button: 0, buttons, detail: type === 'mousedown' ? 1 : 0
+    }));
+  };
+  let x = startX, y = startY, driftY = 0;
+  const moveTo = (nx, ny) => { x = nx; y = ny; fire('mousemove', x, y, 1); };
+
+  fire('mousemove', startX - between(10, 30), startY + between(-8, 8), 0);
+  await sleep(between(60, 140));
+  fire('mouseover', startX, startY, 0, btn);
+  fire('mouseenter', startX, startY, 0, btn);
+  fire('mousemove', startX, startY, 0, btn);
+  await sleep(between(140, 320));
+  fire('mousedown', startX, startY, 1, btn);
+  await sleep(between(80, 200));
+
+  let ratio = 1, travel = need, calibrated = false, tracking = Boolean(sliceCanvas);
+  const steps = Math.round(between(30, 44));
+  let overshoot = sliceCanvas && Math.random() < 0.6 ? between(1.5, 5) : 0;
+  const ease = t => { const u = Math.pow(t, 0.9); return u * u * u * (u * (u * 6 - 15) + 10); };
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    driftY = clamp(driftY + (Math.random() - 0.5) * 1.2, -4, 4);
+    moveTo(startX + (travel + overshoot) * ease(t) + (Math.random() - 0.5) * 0.8, startY + driftY);
+    await sleep(t < 0.15 || t > 0.85 ? between(22, 36) : between(12, 22));
+    if (!calibrated && sliceCanvas && t >= 0.3 && x - startX > 12) {
+      const moved = pieceLeft() - startPiece, mouse = x - startX;
+      const buttonMoved = btn.getBoundingClientRect().left - btnRect.left;
+      if (Math.abs(moved) < 1) {
+        if (Math.abs(buttonMoved) < 1 && mouse > 25) {
+          fire('mouseup', x, y, 0);
+          diag.moved = +moved.toFixed(1);
+          return { status: 'no_response', diag };
+        }
+        // The slider follows the mouse but the slice canvas does not: the widget moves the piece some
+        // other way, so keep dragging by the computed distance without feedback.
+        if (Math.abs(buttonMoved) >= 1) { tracking = false; overshoot = 0; diag.openLoop = true; }
+      } else if (moved / mouse > 0.6 && moved / mouse < 1.6) {
+        ratio = moved / mouse;
+        travel = need / ratio;
+      }
+      calibrated = true;
+    }
+  }
+  let corrections = 0;
+  while (tracking && corrections < 6) {
+    await sleep(between(70, 150));
+    const error = targetLeft - pieceLeft();
+    if (Math.abs(error) <= 0.8) break;
+    corrections++;
+    const delta = clamp(error / ratio, -8, 8);
+    for (let s = 0; s < 3; s++) {
+      moveTo(x + delta / 3, startY + driftY + (Math.random() - 0.5) * 0.6);
+      await sleep(between(18, 40));
+    }
+  }
+  await sleep(between(120, 320));
+  diag.ratio = +ratio.toFixed(3);
+  diag.corrections = corrections;
+  diag.finalErr = tracking ? +(targetLeft - pieceLeft()).toFixed(1) : null;
+  fire('mouseup', x, y, 0);
+
+  // --- 6. What did the widget do? ------------------------------------------------------------
+  const failurePattern = /失败|怪物|吃了|重试|再来|错误|不给力|被吃/;
+  const tipText = () => [...panel.querySelectorAll('[class*="geetest_result_tip"],[class*="geetest_slider_tip"],[class*="geetest_panel_error"],[class*="geetest_error"],[class*="geetest_tip"]')]
+    .filter(shown).map(el => (el.textContent || '').trim()).join(' ');
+  const before = bgSignature();
+  let verdict = '';
+  const deadline = Date.now() + 3200;
+  while (Date.now() < deadline) {
+    await sleep(120);
+    if (!shown(panel) || verified()) { verdict = 'solved'; break; }
+    const tip = tipText();
+    diag.tip = tip.slice(0, 40);
+    if (failurePattern.test(tip)) { verdict = 'failed'; break; }
+    if (bgSignature() !== before) {
+      await sleep(500);
+      verdict = !shown(panel) || verified() ? 'solved' : 'failed';
+      break;
+    }
+  }
+  diag.ms = Date.now() - started;
+  if (verdict === 'solved') {
+    for (let i = 0; i < 15 && shown(panel); i++) await sleep(100);
+    return { status: 'solved', dragDist: Math.round(need), diag };
+  }
+  if (verdict === 'failed') {
+    // The widget normally loads a fresh puzzle by itself; refresh it by hand if it did not.
+    for (let i = 0; i < 25 && bgSignature() === before; i++) await sleep(100);
+    if (bgSignature() === before && await refreshPuzzle()) await sleep(500);
+  }
+  diag.verdict = verdict || 'unknown';
+  return { status: 'need_retry', dragDist: Math.round(need), diag };
+}
+
+async function tryAutoSolveCaptcha(tabId) {
+  return execute(tabId, solveGeetestSlide).catch(error => ({ status: 'error', detail: String(error?.message || error) }));
+}
+
+// Auto-solve is paused after too many failures in a row so the site is not hammered;
+// the user can still finish the captcha by hand and the surrounding wait loops carry on.
+const CAPTCHA_MAX_FAILURES = 6;
+let captchaFailures = 0;
+let captchaPaused = false;
+let captchaNoticeAt = {};
+
+function resetCaptchaState() {
+  captchaFailures = 0;
+  captchaPaused = false;
+  captchaNoticeAt = {};
+}
+
+async function logCaptchaOnce(kind, message, minGap = 30_000) {
+  if (Date.now() - (captchaNoticeAt[kind] || 0) < minGap) return;
+  captchaNoticeAt[kind] = Date.now();
+  await log(message);
+}
+
+function describeCaptcha(result) {
+  const d = result?.diag;
+  if (!d) return result?.detail ? `：${result.detail}` : '';
+  const parts = [];
+  if (d.mode) parts.push(`${d.mode} 置信度${d.conf}`);
+  if (d.need !== undefined) parts.push(`需移动${d.need}px`);
+  if (d.finalErr !== undefined && d.finalErr !== null) parts.push(`松手误差${d.finalErr}px`);
+  if (d.tip) parts.push(`提示“${d.tip}”`);
+  if (d.dom) parts.push(d.dom);
+  return parts.length ? `（${parts.join('，')}）` : '';
+}
+
+// Returns true when a captcha was solved during this call, false when there was nothing to solve or
+// auto-solving gave up (the caller keeps waiting, so a manual solve still works).
+async function handleCaptchaIfPresent(tabId, maxTries = 3) {
+  if (captchaPaused) return false;
+  for (let attempt = 1; attempt <= maxTries; attempt++) {
+    const result = await tryAutoSolveCaptcha(tabId);
+    const status = result?.status;
+    if (!status || status === 'not_found') return false;
+    if (status === 'solved' && result.diag?.note === 'already verified') return false;
+    if (status === 'solved') {
+      captchaFailures = 0;
+      await log(`滑动验证码已通过${result.dragDist ? `（拖动约 ${result.dragDist}px）` : ''}${describeCaptcha(result)}。`);
+      await sleep(500);
+      return true;
+    }
+    if (status === 'clicked_radar' || status === 'canvas_blank' || status === 'no_canvas') {
+      if (status === 'no_canvas') await logCaptchaOnce('no_canvas', `检测到验证码弹窗，但没有找到滑块拼图画布（可能尚未加载或是点选类验证码）；如长时间无变化请手动完成${describeCaptcha(result)}。`);
+      await sleep(1000);
+      continue;
+    }
+    if (status === 'canvas_error') {
+      captchaPaused = true;
+      await log(`验证码图片无法读取${describeCaptcha(result)}，已停止自动识别，请在网页中手动完成滑动。`);
+      return false;
+    }
+    if (status === 'no_response') {
+      captchaPaused = true;
+      await log(`验证码滑块没有响应脚本发出的鼠标事件${describeCaptcha(result)}，已停止自动识别，请在网页中手动完成滑动。`);
+      return false;
+    }
+    if (status === 'error') {
+      await logCaptchaOnce('error', `验证码自动识别出错${describeCaptcha(result)}，稍后重试。`);
+      return false;
+    }
+    captchaFailures++;
+    await log(`验证码自动滑动未通过：${status}${describeCaptcha(result)}（连续失败 ${captchaFailures} 次）。`);
+    if (captchaFailures >= CAPTCHA_MAX_FAILURES) {
+      captchaPaused = true;
+      await log(`验证码自动识别连续失败 ${captchaFailures} 次，已暂停自动识别以免触发风控；请在网页中手动完成滑动，完成后任务会自动继续。`);
+      return false;
+    }
+    await sleep(900 + Math.random() * 700);
+  }
+  return false;
 }
 
 async function prepareHomeTab() {
@@ -210,6 +769,10 @@ async function prepareHomeTab() {
     checking: /Environment Checking/i.test(document.title)
       || /努力加载中/.test(document.body?.innerText || '')
       || document.scripts.length > 0,
+    // Stricter than "checking" (any normal page has scripts): only a real WAF challenge page.
+    waf: /Environment Checking/i.test(document.title)
+      || /努力加载中/.test(document.body?.innerText || '')
+      || (document.scripts.length > 0 && Boolean(document.body) && !document.body.innerText.trim()),
     blank: Boolean(document.body) && !document.body.innerText.trim()
       && ![...document.body.querySelectorAll('input,button,a,iframe')]
         .some(element => element.getClientRects().length)
@@ -242,7 +805,7 @@ async function prepareHomeTab() {
     const tab = await chrome.tabs.get(workTabId).catch(() => null);
     if (tab) {
       if (!await hasSearch(workTabId)) {
-        if (tab.url !== HOME && !(await pageState(workTabId))?.checking) await navigate(workTabId, HOME);
+        if (tab.url !== HOME && !(await pageState(workTabId))?.waf) await navigate(workTabId, HOME);
         if (!await waitForSearch(workTabId)) throw new Error('GSXT 环境校验超过 3 分钟');
       }
       return workTabId;
@@ -268,13 +831,14 @@ async function prepareHomeTab() {
     throw new Error('GSXT 环境校验超过 3 分钟，请稍后重试');
   }
   workTabId = gsxtTabs[0].id;
-  if (gsxtTabs[0].url !== HOME && !(await pageState(workTabId))?.checking) await navigate(workTabId, HOME);
+  if (gsxtTabs[0].url !== HOME && !(await pageState(workTabId))?.waf) await navigate(workTabId, HOME);
   if (await waitForSearch(workTabId)) return workTabId;
   workTabId = null;
   throw new Error('GSXT 环境校验超过 3 分钟，请稍后重试');
 }
 
 async function searchCompany(company, job) {
+  resetCaptchaState();
   // Reuse a verified company detail instead of triggering another search CAPTCHA.
   const openTabs = await chrome.tabs.query({ currentWindow: true });
   for (const tab of openTabs.filter(tab => isGsxtUrl(tab.url))) {
@@ -373,9 +937,12 @@ async function searchCompany(company, job) {
           if (blankState === 'reloaded') break;
           await sleep(1000);
         }
-      } else if (!announced) {
-        announced = true;
-        await log('正在等待查询结果或手动验证码…');
+      } else {
+        if (!announced) {
+          announced = true;
+          await log('正在等待查询结果，尝试自动识别验证码…');
+        }
+        await handleCaptchaIfPresent(tabId);
       }
       await sleep(1000);
     }
@@ -532,6 +1099,7 @@ async function runBatch(job) {
   activeJob = job;
   outputRoot = `GSXT企业信用存档/${stamp}_批量_${job.companies.length}家`;
   messages = [];
+  fullLog = [];
   if (job.disabledExtensions?.length) {
     await log(`已临时停用冲突扩展：${job.disabledExtensions.join('、')}；任务结束后自动恢复。`);
   }
@@ -549,7 +1117,9 @@ async function runBatch(job) {
       }
     }
   } finally {
-    await log(`批量任务结束：成功 ${success} 家，失败 ${failures.length} 家。`);
+    const summary = `批量任务结束：成功 ${success} 家，失败 ${failures.length} 家。`;
+    await saveRunLog(summary).catch(error => log(`运行日志保存失败：${error.message}`));
+    await log(summary);
     await chrome.action.setBadgeText({ text: failures.length ? '!' : '✓' });
     await chrome.action.setBadgeBackgroundColor({ color: failures.length ? '#b3261e' : '#188038' });
     running = false;

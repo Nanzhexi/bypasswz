@@ -8,7 +8,7 @@ const runner = fs.readFileSync('chrome_extension/runner.html', 'utf8');
 const engine = fs.readFileSync('chrome_extension/background.js', 'utf8');
 const blockers = fs.readFileSync('chrome_extension/blockers.js', 'utf8');
 
-assert.equal(manifest.version, '1.7.7');
+assert.equal(manifest.version, '1.7.8');
 assert.equal(manifest.background.service_worker, 'bootstrap.js');
 assert.equal(manifest.action.default_popup, 'popup.html');
 assert.equal(manifest.side_panel.default_path, 'popup.html');

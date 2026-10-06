@@ -2,6 +2,7 @@ import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { chromium } from 'playwright-core';
+import { mockOptions, widgetHtml } from './test_geetest_mock.mjs';
 
 const profile = await mkdtemp(path.join(tmpdir(), 'gsxt-archive-'));
 const extensionPath = path.join(profile, 'extension');
@@ -17,6 +18,10 @@ const blockedMock = process.env.GSXT_MOCK_BLOCKED === '1';
 const blankAfterClickMock = process.env.GSXT_MOCK_BLANK_AFTER_CLICK === '1';
 const persistentBlankMock = process.env.GSXT_MOCK_PERSISTENT_BLANK === '1';
 const inactiveTabMock = process.env.GSXT_MOCK_INACTIVE_TAB === '1';
+const captchaMock = process.env.GSXT_MOCK_CAPTCHA === '1';
+const captchaWidget = captchaMock
+  ? widgetHtml(mockOptions(11, { sliceMode: 'full', moveMode: 'left', scale: 1, naiveScale: false, sliceRatio: 1, panelPosition: 'fixed', listenOn: 'document', noise: 3, dark: false, stripes: false }))
+  : '';
 let blockedServed = false;
 const browser = await chromium.launchPersistentContext(profile, {
   headless: true,
@@ -62,20 +67,28 @@ try {
           location.href = 'https://shiming.gsxt.gov.cn/socialuser-use-rllogin.html';
           return;
         }
-        const link = document.createElement('a');
-        link.textContent = document.querySelector('#keyword').value + '有限公司';
-        link.href = '/detail.html?name=' + encodeURIComponent(link.textContent);
-        if (${inactiveTabMock}) link.target = '_blank';
-        if (${blankAfterClickMock} && (${persistentBlankMock} || !sessionStorage.getItem('blankAfterClickSeen'))) {
-          link.addEventListener('click', event => {
-            event.preventDefault();
-            sessionStorage.setItem('blankAfterClickSeen', 'yes');
-            document.body.replaceChildren();
-          });
+        const showResults = () => {
+          const link = document.createElement('a');
+          link.textContent = document.querySelector('#keyword').value + '有限公司';
+          link.href = '/detail.html?name=' + encodeURIComponent(link.textContent);
+          if (${inactiveTabMock}) link.target = '_blank';
+          if (${blankAfterClickMock} && (${persistentBlankMock} || !sessionStorage.getItem('blankAfterClickSeen'))) {
+            link.addEventListener('click', event => {
+              event.preventDefault();
+              sessionStorage.setItem('blankAfterClickSeen', 'yes');
+              document.body.replaceChildren();
+            });
+          }
+          document.querySelector('#results').replaceChildren(link);
+        };
+        if (${captchaMock}) {
+          window.__onGeetestSuccess = showResults;
+          window.__geetest.show();
+          return;
         }
-        document.querySelector('#results').replaceChildren(link);
+        showResults();
       });
-    </script>`
+    </script>${captchaWidget}`
     });
   });
   const page = await browser.newPage();
@@ -97,16 +110,27 @@ try {
     });
   const status = await popup.locator('#status').innerText();
   if (!status.includes('模糊搜索命中')) throw new Error(status);
-  await popup.locator('#status').filter({ hasText: /批量任务结束/ }).waitFor({ timeout: 180_000 });
+  if (captchaMock && !status.includes('滑动验证码已通过')) throw new Error(`captcha was not solved by the extension\n${status}`);
+  await popup.locator('#status').filter({ hasText: /批量任务结束/ }).waitFor({ timeout: 180_000 }).catch(async error => {
+    throw new Error(`${error.message}\nstatus: ${await popup.locator('#status').innerText()}`);
+  });
   const finalStatus = await popup.locator('#status').innerText();
   if (persistentBlankMock) {
     if (!finalStatus.includes('成功 0 家，失败 1 家') || !finalStatus.includes('重载后仍持续空白')) throw new Error(finalStatus);
   } else if (!finalStatus.includes(`成功 ${batchMock ? 2 : 1} 家，失败 0 家`) || !finalStatus.includes('明细 2 份')) throw new Error(finalStatus);
   if (loginMock && !finalStatus.includes('账号密码已自动填写并提交')) throw new Error(finalStatus);
   if (blankAfterClickMock && !finalStatus.includes('查询页持续空白，正在重载并重新查询一次')) throw new Error(finalStatus);
+  if (captchaMock && !finalStatus.includes('滑动验证码已通过')) throw new Error(finalStatus);
   const downloads = await popup.evaluate(async () => chrome.downloads.search({}));
   if (!persistentBlankMock && (downloads.length < 3 || downloads.some(item => item.state !== 'complete'))) throw new Error(JSON.stringify(downloads.map(item => ({ filename: item.filename, state: item.state }))));
-  console.log(`mock site archive ok: ${items.length} sections, ${downloads.length} PNG screenshots, login: ${loginMock}, batch: ${batchMock}, blocked-first: ${blockedMock}, blank-after-click: ${blankAfterClickMock}, persistent-blank: ${persistentBlankMock}, inactive-tab: ${inactiveTabMock}`);
+  // Playwright redirects downloads to random file names, so recognise the log by its data: URL instead of its path.
+  const logFile = downloads.find(item => item.url.startsWith('data:text/plain'));
+  if (!logFile || logFile.state !== 'complete') throw new Error(`the run log was not saved next to the screenshots\nstatus: ${finalStatus}\ndownloads: ${JSON.stringify(downloads.map(item => [item.url.slice(0, 24), item.state]))}`);
+  const savedLog = decodeURIComponent(logFile.url.slice(logFile.url.indexOf(',') + 1));
+  if (!savedLog.includes('批量任务结束') || !savedLog.includes('开始批量任务')) throw new Error(`saved run log is incomplete:\n${savedLog}`);
+  if (process.env.PRINT_RUN_LOG) console.log(`---- 运行日志.txt ----\n${savedLog}----------------------`);
+  if (captchaMock && !savedLog.includes('滑动验证码已通过')) throw new Error(`saved run log has no captcha result:\n${savedLog}`);
+  console.log(`mock site archive ok: ${items.length} sections, ${downloads.filter(item => item.url.startsWith('data:image/png')).length} PNG screenshots, run log saved, login: ${loginMock}, batch: ${batchMock}, blocked-first: ${blockedMock}, blank-after-click: ${blankAfterClickMock}, persistent-blank: ${persistentBlankMock}, inactive-tab: ${inactiveTabMock}, captcha: ${captchaMock}`);
 } finally {
   await browser.close();
   await rm(profile, { recursive: true, force: true });
