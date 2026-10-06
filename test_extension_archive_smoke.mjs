@@ -123,7 +123,14 @@ try {
   if (captchaMock && !finalStatus.includes('滑动验证码已通过')) throw new Error(finalStatus);
   const downloads = await popup.evaluate(async () => chrome.downloads.search({}));
   if (!persistentBlankMock && (downloads.length < 3 || downloads.some(item => item.state !== 'complete'))) throw new Error(JSON.stringify(downloads.map(item => ({ filename: item.filename, state: item.state }))));
-  console.log(`mock site archive ok: ${items.length} sections, ${downloads.length} PNG screenshots, login: ${loginMock}, batch: ${batchMock}, blocked-first: ${blockedMock}, blank-after-click: ${blankAfterClickMock}, persistent-blank: ${persistentBlankMock}, inactive-tab: ${inactiveTabMock}, captcha: ${captchaMock}`);
+  // Playwright redirects downloads to random file names, so recognise the log by its data: URL instead of its path.
+  const logFile = downloads.find(item => item.url.startsWith('data:text/plain'));
+  if (!logFile || logFile.state !== 'complete') throw new Error(`the run log was not saved next to the screenshots\nstatus: ${finalStatus}\ndownloads: ${JSON.stringify(downloads.map(item => [item.url.slice(0, 24), item.state]))}`);
+  const savedLog = decodeURIComponent(logFile.url.slice(logFile.url.indexOf(',') + 1));
+  if (!savedLog.includes('批量任务结束') || !savedLog.includes('开始批量任务')) throw new Error(`saved run log is incomplete:\n${savedLog}`);
+  if (process.env.PRINT_RUN_LOG) console.log(`---- 运行日志.txt ----\n${savedLog}----------------------`);
+  if (captchaMock && !savedLog.includes('滑动验证码已通过')) throw new Error(`saved run log has no captcha result:\n${savedLog}`);
+  console.log(`mock site archive ok: ${items.length} sections, ${downloads.filter(item => item.url.startsWith('data:image/png')).length} PNG screenshots, run log saved, login: ${loginMock}, batch: ${batchMock}, blocked-first: ${blockedMock}, blank-after-click: ${blankAfterClickMock}, persistent-blank: ${persistentBlankMock}, inactive-tab: ${inactiveTabMock}, captcha: ${captchaMock}`);
 } finally {
   await browser.close();
   await rm(profile, { recursive: true, force: true });

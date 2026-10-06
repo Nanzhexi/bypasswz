@@ -23,6 +23,7 @@ let running = false;
 let activeJob = null;
 let outputRoot = '';
 let messages = [];
+let fullLog = [];
 let workTabId = null;
 
 chrome.storage.local.set({ engineVersion: '1.7.8' }).catch(() => {});
@@ -42,7 +43,35 @@ async function resetGsxtCheck() {
 async function log(message) {
   messages.push(message);
   messages = messages.slice(-100);
+  fullLog.push(`${new Date().toLocaleTimeString('sv-SE')} ${message}`);
+  fullLog = fullLog.slice(-3000);
   await chrome.storage.local.set({ runStatus: { running, text: messages.join('\n') } });
+}
+
+// Keeps a timestamped copy of the whole run log next to the screenshots, so the outcome (for example
+// how a captcha went) can be read from disk without copying it out of the runner page.
+async function saveRunLog(lastLine) {
+  if (!outputRoot) return;
+  const lines = [...fullLog];
+  if (lastLine) lines.push(`${new Date().toLocaleTimeString('sv-SE')} ${lastLine}`);
+  const id = await chrome.downloads.download({
+    url: `data:text/plain;charset=utf-8,${encodeURIComponent(`${lines.join('\n')}\n`)}`,
+    filename: `${outputRoot}/运行日志.txt`,
+    conflictAction: 'uniquify',
+    saveAs: false
+  });
+  await new Promise(resolve => {
+    let timer;
+    const finish = () => {
+      clearTimeout(timer);
+      chrome.downloads.onChanged.removeListener(onChanged);
+      resolve();
+    };
+    const onChanged = delta => { if (delta.id === id && delta.state && delta.state.current !== 'in_progress') finish(); };
+    timer = setTimeout(finish, 5000);
+    chrome.downloads.onChanged.addListener(onChanged);
+    chrome.downloads.search({ id }).then(([item]) => { if (item && item.state !== 'in_progress') finish(); }, finish);
+  });
 }
 
 const safeName = value => String(value).replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').replace(/[. ]+$/, '').slice(0, 100) || 'unnamed';
@@ -1070,6 +1099,7 @@ async function runBatch(job) {
   activeJob = job;
   outputRoot = `GSXT企业信用存档/${stamp}_批量_${job.companies.length}家`;
   messages = [];
+  fullLog = [];
   if (job.disabledExtensions?.length) {
     await log(`已临时停用冲突扩展：${job.disabledExtensions.join('、')}；任务结束后自动恢复。`);
   }
@@ -1087,7 +1117,9 @@ async function runBatch(job) {
       }
     }
   } finally {
-    await log(`批量任务结束：成功 ${success} 家，失败 ${failures.length} 家。`);
+    const summary = `批量任务结束：成功 ${success} 家，失败 ${failures.length} 家。`;
+    await saveRunLog(summary).catch(error => log(`运行日志保存失败：${error.message}`));
+    await log(summary);
     await chrome.action.setBadgeText({ text: failures.length ? '!' : '✓' });
     await chrome.action.setBadgeBackgroundColor({ color: failures.length ? '#b3261e' : '#188038' });
     running = false;
